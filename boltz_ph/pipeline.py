@@ -310,8 +310,9 @@ class ProteinHunter_Boltz:
             "sampling_steps": self.args.diffuse_steps,
             "diffusion_samples": 1,
             "write_confidence_summary": True,
-            "write_full_pae": False,
+            "write_full_pae": True,
             "write_full_pde": False,
+            "output_format": "mmcif",
             "max_parallel_samples": 1,
         }
         return get_boltz_model(
@@ -398,9 +399,9 @@ class ProteinHunter_Boltz:
                 boltz_model_version=a.boltz_model_version,
                 pocket_conditioning=pocket_conditioning,
             )
-            pdb_filename = f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_0.pdb"
+            pdb_filename = f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_0.cif"
             plddts = output["plddt"].detach().cpu().numpy()[0]
-            save_pdb(structure, output["coords"], plddts, pdb_filename)
+            save_pdb(structure, output["coords"], plddts, pdb_filename, pae=output.get("pae"))
 
             contact_check_okay = True
             if a.contact_residues.strip() and not a.no_contact_filter:
@@ -475,11 +476,13 @@ class ProteinHunter_Boltz:
             )
 
             # 1. Design Sequence
-            model_type = (
-                "ligand_mpnn"
-                if (a.ligand_smiles or a.ligand_ccd or a.nucleic_seq)
-                else "soluble_mpnn"
-            )
+            model_type = getattr(a, 'mpnn_model_type', None)
+            if model_type is None:
+                model_type = (
+                    "ligand_mpnn"
+                    if (a.ligand_smiles or a.ligand_ccd or a.nucleic_seq)
+                    else "soluble_mpnn"
+                )
             design_kwargs = {
                 "pdb_file": pdb_filename,
                 "temperature": a.temperature,
@@ -513,6 +516,8 @@ class ProteinHunter_Boltz:
                 ccd_path=self.ccd_path,
                 logmd=False,
                 device=self.device,
+                boltz_model_version=a.boltz_model_version,
+                pocket_conditioning=pocket_conditioning,
             )
 
             # Calculate ipTM
@@ -532,14 +537,35 @@ class ProteinHunter_Boltz:
             else:
                 current_iptm = 0.0
 
-            # Update best structure (only if alanine content is acceptable)
+            # Update best structure (only if alanine content is acceptable and contacts are met)
+            passes_contact_check = True
             if alanine_percentage <= 0.20 and current_iptm > best_iptm:
+                # Check contact residues before accepting as best
+                if a.contact_residues.strip() and not a.no_contact_filter:
+                    tmp_pdb = f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.cif"
+                    plddts_tmp = output["plddt"].detach().cpu().numpy()[0]
+                    save_pdb(structure, output["coords"], plddts_tmp, tmp_pdb)
+                    try:
+                        passes_contact_check = all([binder_binds_contacts(
+                            tmp_pdb,
+                            self.binder_chain,
+                            protein_chain_ids[i],
+                            contact_res,
+                            cutoff=a.contact_cutoff,
+                        )
+                        for i, contact_res in enumerate(a.contact_residues.split("|"))
+                    ])
+                    except Exception as e:
+                        print(f"WARNING: Contact check failed in cycle {cycle + 1}: {e}")
+                        passes_contact_check = True  # Fail open
+
+            if alanine_percentage <= 0.20 and current_iptm > best_iptm and passes_contact_check:
                 best_iptm = current_iptm
                 best_seq = seq
                 best_structure = copy.deepcopy(structure)
                 best_output = shallow_copy_tensor_dict(output)
                 best_pdb_filename = (
-                    f"{run_save_dir}/{a.name}_run_{run_id}_best_structure.pdb"
+                    f"{run_save_dir}/{a.name}_run_{run_id}_best_structure.cif"
                 )
                 best_plddts = best_output["plddt"].detach().cpu().numpy()[0]
                 save_pdb(
@@ -547,6 +573,7 @@ class ProteinHunter_Boltz:
                     best_output["coords"],
                     best_plddts,
                     best_pdb_filename,
+                    pae=best_output.get("pae"),
                 )
                 best_cycle_idx = cycle + 1
                 best_alanine_percentage = alanine_percentage
@@ -572,10 +599,10 @@ class ProteinHunter_Boltz:
             run_metrics[f"cycle_{cycle + 1}_seq"] = seq
 
             pdb_filename = (
-                f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.pdb"
+                f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.cif"
             )
             plddts = output["plddt"].detach().cpu().numpy()[0]
-            save_pdb(structure, output["coords"], plddts, pdb_filename)
+            save_pdb(structure, output["coords"], plddts, pdb_filename, pae=output.get("pae"))
             clean_memory()
 
             print(
@@ -589,7 +616,7 @@ class ProteinHunter_Boltz:
             )
 
             if save_yaml_this_design and a.contact_residues.strip():
-                this_cycle_pdb_filename = f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.pdb"
+                this_cycle_pdb_filename = f"{run_save_dir}/{a.name}_run_{run_id}_predicted_cycle_{cycle + 1}.cif"
                 try:
                     contact_binds = all([binder_binds_contacts(
                         this_cycle_pdb_filename,
@@ -628,7 +655,7 @@ class ProteinHunter_Boltz:
                 os.makedirs(high_iptm_pdb_dir, exist_ok=True)
                 
                 # Use the 'base_filename' for a consistent destination name
-                pdb_base_name = f"{base_filename}_structure.pdb" 
+                pdb_base_name = f"{base_filename}_structure.cif" 
                 dest_pdb_path = os.path.join(high_iptm_pdb_dir, pdb_base_name)
                 
                 # Use 'pdb_filename', which is *always* defined just above this block
@@ -676,11 +703,82 @@ class ProteinHunter_Boltz:
                 .numpy()[0]
             )
             run_metrics["best_seq"] = best_seq
+
+            # Re-predict best sequence without pocket conditioning for unbiased metrics
+            if pocket_conditioning:
+                uncond_output, uncond_structure = run_prediction(
+                    data_cp,
+                    self.binder_chain,
+                    seq=best_seq,
+                    randomly_kill_helix_feature=False,
+                    negative_helix_constant=0.0,
+                    boltz_model=self.boltz_model,
+                    ccd_lib=self.ccd_lib,
+                    ccd_path=self.ccd_path,
+                    logmd=False,
+                    device=self.device,
+                    boltz_model_version=a.boltz_model_version,
+                    pocket_conditioning=False,
+                )
+                # Save unconditioned PDB
+                uncond_pdb_filename = (
+                    f"{run_save_dir}/{a.name}_run_{run_id}_best_unconditioned.cif"
+                )
+                uncond_plddts = uncond_output["plddt"].detach().cpu().numpy()[0]
+                save_pdb(uncond_structure, uncond_output["coords"], uncond_plddts, uncond_pdb_filename, pae=uncond_output.get("pae"))
+
+                # Compute unconditioned iPTM
+                uncond_pair_chains = uncond_output["pair_chains_iptm"]
+                if len(uncond_pair_chains) > 1:
+                    uncond_values = [
+                        (
+                            uncond_pair_chains[binder_chain_idx][i].detach().cpu().numpy()
+                            + uncond_pair_chains[i][binder_chain_idx].detach().cpu().numpy()
+                        )
+                        / 2.0
+                        for i in range(len(uncond_pair_chains))
+                        if i != binder_chain_idx
+                    ]
+                    uncond_iptm = float(np.mean(uncond_values) if uncond_values else 0.0)
+                else:
+                    uncond_iptm = 0.0
+
+                uncond_plddt = float(
+                    uncond_output.get("complex_plddt", torch.tensor([0.0])).detach().cpu().numpy()[0]
+                )
+                uncond_iplddt = float(
+                    uncond_output.get("complex_iplddt", torch.tensor([0.0])).detach().cpu().numpy()[0]
+                )
+                uncond_pae = float(
+                    uncond_output.get("pae", torch.tensor([0.0])).detach().cpu().numpy().mean()
+                )
+
+                run_metrics["best_uncond_iptm"] = uncond_iptm
+                run_metrics["best_uncond_plddt"] = uncond_plddt
+                run_metrics["best_uncond_iplddt"] = uncond_iplddt
+                run_metrics["best_uncond_pae"] = uncond_pae
+                run_metrics["best_uncond_pdb"] = uncond_pdb_filename
+
+                print(
+                    f"  🔄 Unconditioned re-prediction: iPTM={uncond_iptm:.3f} pLDDT={uncond_plddt:.2f} iPLDDT={uncond_iplddt:.2f} PAE={uncond_pae:.2f}"
+                )
+                clean_memory()
+            else:
+                run_metrics["best_uncond_iptm"] = float("nan")
+                run_metrics["best_uncond_plddt"] = float("nan")
+                run_metrics["best_uncond_iplddt"] = float("nan")
+                run_metrics["best_uncond_pae"] = float("nan")
+                run_metrics["best_uncond_pdb"] = None
         else:
             run_metrics["best_iptm"] = float("nan")
             run_metrics["best_cycle"] = None
             run_metrics["best_plddt"] = float("nan")
             run_metrics["best_seq"] = None
+            run_metrics["best_uncond_iptm"] = float("nan")
+            run_metrics["best_uncond_plddt"] = float("nan")
+            run_metrics["best_uncond_iplddt"] = float("nan")
+            run_metrics["best_uncond_pae"] = float("nan")
+            run_metrics["best_uncond_pdb"] = None
 
         if a.plot:
             plot_run_metrics(run_save_dir, a.name, run_id, a.num_cycles, run_metrics)
@@ -703,7 +801,9 @@ class ProteinHunter_Boltz:
                 ]
             )
         # Best metric columns
-        columns.extend(["best_iptm", "best_cycle", "best_plddt", "best_seq"])
+        columns.extend(["best_iptm", "best_cycle", "best_plddt", "best_seq",
+                        "best_uncond_iptm", "best_uncond_plddt", "best_uncond_iplddt",
+                        "best_uncond_pae", "best_uncond_pdb"])
 
         summary_csv = os.path.join(self.save_dir, "summary_all_runs.csv")
         df = pd.DataFrame(all_run_metrics)
@@ -788,7 +888,10 @@ class ProteinHunter_Boltz:
             run_metrics = self._run_design_cycle(data_cp, run_id, pocket_conditioning)
             all_run_metrics.append(run_metrics)
 
-        # 3. Save Summary
+            # Save summary incrementally after each run (survives Ctrl+C)
+            self._save_summary_metrics(all_run_metrics)
+
+        # 3. Save Summary (final)
         self._save_summary_metrics(all_run_metrics)
 
         # 4. Run Downstream Validation

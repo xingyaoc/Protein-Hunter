@@ -87,6 +87,7 @@ from chai_lab.data.features.generators.token_dist_restraint import (
 )
 from chai_lab.data.features.generators.token_pair_pocket_restraint import (
     TokenPairPocketRestraint,
+    RestraintGroup as PocketRestraint,
 )
 from chai_lab.data.features.feature_factory import FeatureFactory
 from chai_lab.data.features.feature_type import FeatureType
@@ -452,6 +453,7 @@ class ChaiFolder:
         chains: List[Chain],
         structure_context: AllAtomStructureContext,
         opts_per_chain: List[ChainOpts],
+        pocket_restraints: Optional[List] = None,
     ) -> AllAtomFeatureContext:
         """Build all feature contexts (MSA, templates, embeddings, restraints)"""
         n_tokens = structure_context.num_tokens
@@ -465,7 +467,14 @@ class ChaiFolder:
         embedding_context = self._build_embedding_context_per_chain(
             chains, opts_per_chain
         )
-        restraint_context = RestraintContext.empty()
+        if pocket_restraints:
+            restraint_context = RestraintContext(
+                docking_restraints=None,
+                contact_restraints=None,
+                pocket_restraints=pocket_restraints,
+            )
+        else:
+            restraint_context = RestraintContext.empty()
 
         return AllAtomFeatureContext(
             chains=chains,
@@ -536,7 +545,7 @@ class ChaiFolder:
     # ==============================================================================
     # PATCH 5: Update prep_inputs() (Around line 485)
     # ==============================================================================
-    def prep_inputs(self, sequences: List[Tuple[str, str, str, Dict]]) -> None:
+    def prep_inputs(self, sequences: List[Tuple[str, str, str, Dict]], pocket_restraints: Optional[List] = None) -> None:
         """Main entry point: prepare inputs for folding"""
         # Clear any previous intermediate state, keeping loaded models
         self._cleanup_intermediate_data()  # Clears _init_reps, _trunk_reps, _current_batch["features"]
@@ -561,7 +570,7 @@ class ChaiFolder:
 
             # Build feature context and batch (on CPU initially)
             self.state.feature_context = self._build_feature_contexts(
-                chains, structure_context, opts_per_chain
+                chains, structure_context, opts_per_chain, pocket_restraints=pocket_restraints
             )
             # PATCH 9 (GLOBAL): self.state.batch -> self._current_batch
             # Store the full batch (inputs+features) temporarily on CPU

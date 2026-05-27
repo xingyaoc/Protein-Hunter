@@ -111,6 +111,11 @@ def parse_args():
     parser.add_argument("--alanine_bias", action="store_true")
     parser.add_argument("--high_iptm_threshold", default=0.8, type=float)
     parser.add_argument("--high_plddt_threshold", default=0.8, type=float)
+    parser.add_argument(
+        "--mpnn_model_type", type=str, default=None,
+        choices=["soluble_mpnn", "ligand_mpnn", "cyclic_mpnn"],
+        help="MPNN model type. If not set, auto-detected from target type.",
+    )
     # --- End Existing Arguments ---
 
     return parser.parse_args()

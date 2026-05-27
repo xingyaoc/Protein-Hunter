@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import py3Dmol
 import torch
-from prody import parsePDB
+from prody import parsePDB, parseMMCIF
 
 
 from boltz_ph.constants import CHAIN_TO_NUMBER
@@ -37,6 +37,7 @@ from boltz.data.types import (
     StructureV2,
 )
 from boltz.data.write.pdb import to_pdb
+from boltz.data.write.mmcif import to_mmcif
 from boltz.main import (
     Boltz2DiffusionParams,
     BoltzSteeringParams,
@@ -112,8 +113,10 @@ def binder_binds_contacts(
         if contact_residues.strip() == "":
             return True
         contact_residues = [int(x) for x in contact_residues.split(",") if x.strip()]
-
-    structure = parsePDB(pdb_path)
+    if str(pdb_path).endswith(".cif"):
+        structure = parseMMCIF(pdb_path)
+    else:
+        structure = parsePDB(pdb_path)
     if structure is None:
         return False
 
@@ -140,6 +143,8 @@ def binder_binds_contacts(
     contact_indices = [
         i for i, resnum in enumerate(target_resnums) if resnum in contact_residues
     ]
+    print(f"contact_indices: {contact_indices}")
+    print(f"contact residue AAs: {[target_ca_atoms[i].getResname() for i in contact_indices]}")
     if not contact_indices:
         return False
 
@@ -556,14 +561,23 @@ def run_prediction(
     return output, structure
 
 
-def save_pdb(structure, coords, plddts, filename):
-    """Saves the predicted structure coordinates to a PDB file."""
+def save_pdb(structure, coords, plddts, filename, pae=None):
+    """Saves the predicted structure coordinates to a CIF or PDB file based on extension.
+    Optionally saves the PAE matrix as a .npz file alongside the structure."""
     structure.atoms["coords"] = (
         coords[0].detach().cpu().numpy()[: structure.atoms["coords"].shape[0]]
     )
     
     with open(filename, "w") as f:
-        f.write(to_pdb(structure, plddts, boltz2=True))
+        if str(filename).endswith(".cif"):
+            f.write(to_mmcif(structure, plddts, boltz2=True))
+        else:
+            f.write(to_pdb(structure, plddts, boltz2=True))
+
+    if pae is not None:
+        pae_arr = pae.detach().cpu().numpy() if hasattr(pae, "detach") else np.array(pae)
+        pae_path = str(filename).rsplit(".", 1)[0] + "_pae.npz"
+        np.savez_compressed(pae_path, pae=pae_arr)
 
 
 def design_sequence(

@@ -26,6 +26,8 @@ from chai_ph.helpers import (
     compute_ca_rmsd,
 )
 from LigandMPNN.wrapper import LigandMPNNWrapper
+from boltz_ph.model_utils import binder_binds_contacts
+
 
 def optimize_protein_design(
     folder: ChaiFolder,
@@ -57,6 +59,10 @@ def optimize_protein_design(
     omit_AA: Optional[str] = None,
     randomize_template_sequence: bool = True,
     cyclic: bool = False,
+    mpnn_model_type: Optional[str] = None,
+    contact_residues: Optional[str] = None,
+    contact_cutoff: float = 15.0,
+    max_contact_filter_retries: int = 6,
     final_validation: bool = True,
     verbose: bool = False,
     viewer: Optional[py2Dmol.view] = None,
@@ -123,12 +129,47 @@ def optimize_protein_design(
         is_ligand_target = is_smiles(target_seq)
 
     is_binder_design = target_seq is not None
-    mpnn_model_type = "ligand_mpnn" if is_ligand_target else "soluble_mpnn"
+    if mpnn_model_type is None:
+        mpnn_model_type = "ligand_mpnn" if is_ligand_target else "soluble_mpnn"
     target_entity_type = "ligand" if is_ligand_target else "protein"
     if is_binder_design:
         use_entity_names = [binder_chain, target_chain]
     else:
         use_entity_names = [binder_chain]
+
+    # Build pocket restraints from contact_residues
+    pocket_restraints = None
+    if contact_residues and is_binder_design and not is_ligand_target:
+        from chai_lab.data import residue_constants as rc
+        from chai_lab.data.features.generators.token_pair_pocket_restraint import (
+            RestraintGroup as PocketRestraint,
+        )
+        pocket_restraints = []
+        # In prep_inputs ordering: target is first (subchain "A"), binder is second (subchain "B")
+        target_subchain_id = "A"
+        binder_subchain_id = "B"
+        for idx_str in contact_residues.split(","):
+            idx_str = idx_str.strip()
+            if not idx_str:
+                continue
+            res_idx_1based = int(idx_str)
+            res_idx_0based = res_idx_1based - 1
+            if res_idx_0based < 0 or res_idx_0based >= len(target_seq):
+                print(f"Warning: contact_residue {res_idx_1based} out of range for target (len={len(target_seq)}), skipping.")
+                continue
+            res_1letter = target_seq[res_idx_0based]
+            res_3letter = rc.restype_1to3_with_x.get(res_1letter, "UNK")
+            pocket_restraints.append(PocketRestraint(
+                pocket_chain_subchain_id=binder_subchain_id,
+                pocket_token_subchain_id=target_subchain_id,
+                pocket_token_residue_index=res_idx_0based,
+                pocket_token_residue_name=res_3letter,
+                pocket_distance_threshold=10.0,
+            ))
+        if pocket_restraints:
+            print(f"Pocket conditioning: {len(pocket_restraints)} contact residues on target")
+        else:
+            pocket_restraints = None
 
     # Calculate PDE bins
     bin_centers = _bin_centers(0.0, 32.0, 64)
@@ -249,7 +290,17 @@ def optimize_protein_design(
             template_weight = compute_template_weight(
                 prev["state"].result["pde"], prev["n_target"]
             )
-        folder.prep_inputs(chains)
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Chai cofolding input params:")
+            for i, (seq, chain_id, entity_type, opts) in enumerate(chains):
+                print(f"  Chain {i}: id={chain_id}, type={entity_type}, seq_len={len(seq)}, seq={seq[:50]}{'...' if len(seq)>50 else ''}")
+                print(f"    opts: {opts}")
+            print(f"  num_trunk_recycles={num_trunk_recycles}, num_diffn_timesteps={num_diffn_timesteps}")
+            print(f"  template_weight={'None' if template_weight is None else template_weight.shape}")
+            print(f"{'='*60}\n")
+
+        folder.prep_inputs(chains, pocket_restraints=pocket_restraints)
         folder.get_embeddings()
         folder.run_trunk(
             num_trunk_recycles=num_trunk_recycles, template_weight=template_weight
@@ -327,6 +378,10 @@ def optimize_protein_design(
         if mpnn_model_type == "ligand_mpnn":
             extra_args["--checkpoint_ligand_mpnn"] = os.path.join(
                 MODEL_DIR, "ligandmpnn_v_32_010_25.pt"
+            )
+        elif mpnn_model_type == "cyclic_mpnn":
+            extra_args["--checkpoint_protein_mpnn"] = os.path.join(
+                MODEL_DIR, "cyclicmpnn_48_010.pt"
             )
         else:
             extra_args["--checkpoint_soluble_mpnn"] = os.path.join(
@@ -432,20 +487,50 @@ def optimize_protein_design(
     metrics_list = []
     seq_per_cycle = []
 
-    # Step 0
+    # Step 0 with contact filtering
     print(f"Initial seq: {initial_seq}")
     prev = {"seq": initial_seq}
+    contact_filter_attempt = 0
     try:
-        prev["state"] = fold_sequence(prev["seq"], is_first_iteration=True)
-        if prev["state"] is None or prev["state"].result is None:
-            raise RuntimeError("Initial folding failed to produce results.")
+        while True:
+            prev["state"] = fold_sequence(prev["seq"], is_first_iteration=True)
+            if prev["state"] is None or prev["state"].result is None:
+                raise RuntimeError("Initial folding failed to produce results.")
 
-        prev["bb"] = get_backbone_coords_from_result(prev["state"])
-        prev["pdb"] = f"{prefix}/cycle_0.cif"
-        folder.save(
-            prev["pdb"],
-            use_entity_names=use_entity_names,
-        )
+            prev["bb"] = get_backbone_coords_from_result(prev["state"])
+            prev["pdb"] = f"{prefix}/cycle_0.cif"
+            folder.save(
+                prev["pdb"],
+                use_entity_names=use_entity_names,
+            )
+
+            # Contact filter check
+            contact_check_okay = True
+            if contact_residues and is_binder_design:
+                try:
+                    binds = binder_binds_contacts(
+                        prev["pdb"], binder_chain, target_chain,
+                        contact_residues, cutoff=contact_cutoff,
+                    )
+                    if not binds:
+                        print("❌ Binder does NOT contact required residues after cycle 0. Retrying...")
+                        contact_check_okay = False
+                except Exception as e:
+                    print(f"WARNING: Could not perform binder-contact check: {e}")
+                    contact_check_okay = True  # Fail open
+
+            if contact_check_okay:
+                break
+            contact_filter_attempt += 1
+            if contact_filter_attempt >= max_contact_filter_retries:
+                print("WARNING: Max retries for contact filtering reached. Proceeding.")
+                break
+
+            # Resample initial sequence and retry
+            prev["seq"] = sample_seq(len(initial_seq))
+            print(f"Resampled seq: {prev['seq']}")
+            folder.full_cleanup()
+
         msg, metric_dict = format_metrics(prev)
         iptm0 = metric_dict.get("iptm") if is_binder_design else None
         plddt0 = metric_dict.get("plddt")
@@ -553,7 +638,7 @@ def optimize_protein_design(
                             "id": [target_chain],
                             "sequence": target_seq,
                             "msa": "empty",
-                            "cyclic": cyclic
+                            # "cyclic": cyclic
                         }
                     }
                 elif binder_mode == "ligand":
@@ -765,7 +850,7 @@ def optimize_protein_design(
                 opts = {"use_esm": use_esm, "cyclic": cyclic}
                 chains.append([best["seq"], binder_chain, "protein", opts])
 
-            folder.prep_inputs(chains)
+            folder.prep_inputs(chains, pocket_restraints=pocket_restraints)
             folder.get_embeddings()
             folder.run_trunk(
                 num_trunk_recycles=num_trunk_recycles, template_weight=None
@@ -849,6 +934,11 @@ class ProteinHunter_Chai:
         self.high_iptm_threshold = args.high_iptm_threshold
         self.high_plddt_threshold = args.high_plddt_threshold
         self.plot = args.plot
+        self.verbose = getattr(args, 'verbose', False)
+        self.mpnn_model_type = getattr(args, 'mpnn_model_type', None)
+        self.contact_residues = getattr(args, 'contact_residues', '') or None
+        self.contact_cutoff = getattr(args, 'contact_cutoff', 15.0)
+        self.max_contact_filter_retries = getattr(args, 'max_contact_filter_retries', 6)
         self.binder_chain = "A"
         self.target_chain = "B"
 
@@ -958,7 +1048,11 @@ class ProteinHunter_Chai:
                 randomize_template_sequence=True,
                 omit_AA=self.omit_AA,
                 cyclic=self.cyclic,
-                verbose=False,
+                mpnn_model_type=self.mpnn_model_type,
+                contact_residues=self.contact_residues,
+                contact_cutoff=self.contact_cutoff,
+                max_contact_filter_retries=self.max_contact_filter_retries,
+                verbose=self.verbose,
                 viewer=self.viewer,
                 render_freq=self.render_freq,
                 final_validation=self.repredict,

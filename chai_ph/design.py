@@ -100,8 +100,28 @@ def parse_args():
         help="Re-predict final best structure without templates for validation.",
     )
 
+    # --- Pocket Conditioning ---
+    pocket_group = parser.add_argument_group("Pocket Conditioning")
+    pocket_group.add_argument(
+        "--contact_residues", type=str, default="",
+        help="Comma-separated 1-based residue indices on the target to constrain binding (e.g. '10,15,20').",
+    )
+    pocket_group.add_argument(
+        "--contact_cutoff", type=float, default=15.0,
+        help="Distance cutoff (Å) for contact filtering between binder and specified residues.",
+    )
+    pocket_group.add_argument(
+        "--max_contact_filter_retries", type=int, default=10,
+        help="Max retries for initial fold contact filtering before proceeding.",
+    )
+
     # --- MPNN Options ---
     mpnn_group = parser.add_argument_group("ProteinMPNN Settings")
+    mpnn_group.add_argument(
+        "--mpnn_model_type", type=str, default=None,
+        choices=["soluble_mpnn", "ligand_mpnn", "cyclic_mpnn"],
+        help="MPNN model type. If not set, auto-detected from target type.",
+    )
     mpnn_group.add_argument(
         "--omit_aa", type=str, default="", help="Amino acid types to omit from design (e.g., 'C')."
     )
@@ -140,6 +160,9 @@ def parse_args():
         help="Plot cycles figs per run (requires matplotlib).",
     )
     vis_group.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use.")
+    vis_group.add_argument(
+        "--verbose", action="store_true", default=False, help="Print detailed folding params each cycle."
+    )
 
 
     af_group = parser.add_argument_group("AlphaFold Settings")
